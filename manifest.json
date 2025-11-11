@@ -1,0 +1,8 @@
+{
+  "package": "mc_mapper",
+  "name": "MC Mapper",
+  "mod": 4,
+  "min_point_version": 35,
+  "max_point_version": 99,
+  "conflicts": []
+}

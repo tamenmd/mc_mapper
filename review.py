@@ -1,0 +1,240 @@
+# review.py — konsistente, gut scannbare rechte Seite (Label inline), kompakte ALT-Ansicht
+import re
+from aqt.qt import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser,
+    QLabel, QLineEdit, QMessageBox, QWidget, QScrollArea,
+    Qt, QCheckBox, QUrl, QTextOption
+)
+from aqt import mw
+from anki.notes import Note
+
+from .config import TARGET_MODEL_NAME, FIELDS, TAG_NEW
+from .parsing import parse_note_to_proposal
+from .util import find_model_by_name, html_preview, normalize_combo_key, key_to_tag
+
+def _with_img_breaks_exact(html: str) -> str:
+    if not html:
+        return ""
+    def repl(m):
+        return "<br>" + m.group(1) + "<br>"
+    html = re.sub(r"(?is)(?:\s*(?:<br\s*/?>\s*)+)?(<img\b[^>]*>)(?:\s*(?:<br\s*/?>\s*)+)?", repl, html)
+    html = re.sub(r"(?is)(<br\s*/?>\s*){3,}", r"<br><br>", html)
+    return html
+
+def _inline_html(s: str) -> str:
+    if not s:
+        return ""
+    s = s.replace("\r\n","\n").replace("\r","\n")
+    s = re.sub(r"\n{2,}", "\n", s)
+    return s.replace("\n","<br>")
+
+class EditForm(QDialog):
+    def __init__(self, parent, proposal, orig_note):
+        super().__init__(parent)
+        self.setWindowTitle("MC-Mapper – Bearbeiten")
+        self.values = proposal.copy()
+
+        left = QVBoxLayout()
+        left.addWidget(QLabel("ALT (Original)"))
+        self.oldView = QTextBrowser()
+        self.oldView.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        self.oldView.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.oldView.setHtml(html_preview(orig_note, parent.mw.col.media.dir()))
+        left.addWidget(self.oldView)
+
+        formLay = QVBoxLayout()
+        self.edits = {}
+        for f in FIELDS:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(f, self))
+            le = QLineEdit(self.values.get(f, ""))
+            self.edits[f] = le
+            row.addWidget(le)
+            formLay.addLayout(row)
+        formWrap = QWidget(); formWrap.setLayout(formLay)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(formWrap)
+
+        right = QVBoxLayout(); right.addWidget(QLabel("NEU (Ziel-Felder)")); right.addWidget(scroll)
+        ok = QPushButton("OK"); cancel = QPushButton("Abbrechen")
+        ok.clicked.connect(self.accept); cancel.clicked.connect(self.reject)
+        btns = QHBoxLayout(); btns.addWidget(ok); btns.addWidget(cancel)
+
+        top = QHBoxLayout(); top.addLayout(left,1); top.addLayout(right,1)
+        lay = QVBoxLayout(self); lay.addLayout(top); lay.addLayout(btns)
+
+    def get_values(self):
+        for f, le in self.edits.items():
+            self.values[f] = le.text()
+        return self.values
+
+class Review(QDialog):
+    def __init__(self, mw, note_ids):
+        super().__init__(mw)
+        self.mw = mw
+        self.all_note_ids = list(note_ids) if note_ids else list(mw.col.find_notes("deck:current"))
+        self.note_ids = list(self.all_note_ids)
+        self.i = 0
+        self.setWindowTitle("MC-Mapper – Review")
+
+        self.oldView = QTextBrowser()
+        self.newView = QTextBrowser()
+        for v in (self.oldView, self.newView):
+            v.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+            v.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.newView.document().setBaseUrl(QUrl.fromLocalFile(self.mw.col.media.dir() + "/"))
+
+        self.info = QLabel("")
+
+        self.btnPrev = QPushButton("◀ Zurück")
+        self.btnNext = QPushButton("Weiter ▶")
+        self.jumpEdit = QLineEdit(); self.jumpEdit.setPlaceholderText("zu # springen…"); self.jumpEdit.setFixedWidth(100)
+        self.btnJump = QPushButton("Go")
+        self.btnApply = QPushButton("Übernehmen")
+        self.btnEdit = QPushButton("Bearbeiten…")
+
+        self.btnPrev.clicked.connect(self.prev)
+        self.btnNext.clicked.connect(self.next)
+        self.btnJump.clicked.connect(self.jump_to)
+        self.jumpEdit.returnPressed.connect(self.jump_to)
+        self.btnApply.clicked.connect(self.apply_current)
+        self.btnEdit.clicked.connect(self.edit_current)
+
+        self.chkHideMigr = QCheckBox('„migrated/by-mc-mapper“ ausblenden')
+        self.chkHideMigr.setToolTip("ALT-Karten, die bereits markiert wurden, im Review ausblenden.")
+        self.chkHideMigr.stateChanged.connect(self._apply_filter)
+
+        top = QHBoxLayout()
+        left = QVBoxLayout();  left.addWidget(QLabel("ALT"));           left.addWidget(self.oldView)
+        right = QVBoxLayout(); right.addWidget(QLabel("NEU (Vorschlag)")); right.addWidget(self.newView)
+        top.addLayout(left); top.addLayout(right)
+
+        nav = QHBoxLayout()
+        nav.addWidget(self.btnPrev); nav.addWidget(self.btnNext); nav.addSpacing(12)
+        nav.addWidget(QLabel("Position:")); self.posLbl = QLabel(""); nav.addWidget(self.posLbl)
+        nav.addSpacing(12); nav.addWidget(self.jumpEdit); nav.addWidget(self.btnJump)
+        nav.addStretch(); nav.addWidget(self.chkHideMigr); nav.addSpacing(12); nav.addWidget(self.info)
+
+        actions = QHBoxLayout(); actions.addStretch(); actions.addWidget(self.btnEdit); actions.addWidget(self.btnApply)
+
+        lay = QVBoxLayout(self); lay.addLayout(top); lay.addLayout(nav); lay.addLayout(actions)
+
+        self.model = find_model_by_name(self.mw.col, TARGET_MODEL_NAME)
+        if not self.model:
+            QMessageBox.critical(self, "Fehlt", f"Notiztyp '{TARGET_MODEL_NAME}' nicht gefunden.")
+            self.reject(); return
+
+        self._apply_filter()
+        self.load()
+
+    def _render_prop_html(self, prop: dict) -> str:
+        css = """
+        <style>
+          .wrap { font-family: Segoe UI, Arial; font-size:12px; line-height:1.35; }
+          .card { border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 10px; }
+          .row  { margin: 4px 0 6px; }
+          .lab  { font-weight:700; display:inline-block; min-width:110px; }
+          .val  { display:inline; }
+          .sep  { margin: 8px 0; border-top: 1px dashed rgba(255,255,255,0.15); }
+          img   { max-width:100%; height:auto; display:block; margin:6px 0; }
+        </style>
+        """
+        rows = []
+        def add_row(label, value):
+            rows.append(f"<div class='row'><span class='lab'>{label}:</span> <span class='val'>{_inline_html(value)}</span></div>")
+
+        add_row("Frage",     prop.get("Frage",""))
+        rows.append("<div class='sep'></div>")
+        for k in ["Antwort A","Antwort B","Antwort C","Antwort D","Antwort E"]:
+            add_row(k, prop.get(k,""))
+        rows.append("<div class='sep'></div>")
+        add_row("Kopfzeile",      prop.get("Kopfzeile",""))
+        add_row("Eigene Notizen", prop.get("Eigene Notizen",""))
+        add_row("Antwort",        prop.get("Antwort",""))
+
+        return css + "<div class='wrap'><div class='card'>" + "".join(rows) + "</div></div>"
+
+    def _apply_filter(self):
+        if not self.chkHideMigr.isChecked():
+            self.note_ids = list(self.all_note_ids)
+        else:
+            self.note_ids = [nid for nid in self.all_note_ids if TAG_NEW not in self.mw.col.get_note(nid).tags]
+        self.i = 0; self._clamp()
+
+    def _clamp(self):
+        self.i = max(0, min(self.i, len(self.note_ids)-1))
+        self.btnPrev.setEnabled(self.i > 0); self.btnNext.setEnabled(self.i < len(self.note_ids)-1)
+        total = len(self.note_ids); self.posLbl.setText(f"{(self.i+1) if total else 0}/{total}")
+
+    def load(self):
+        if not self.note_ids:
+            self.oldView.setHtml("<i>Keine Notizen in der aktuellen Auswahl/Filter.</i>")
+            self.newView.setHtml(""); self.info.setText(""); self._clamp(); return
+
+        self._clamp()
+        nid = self.note_ids[self.i]
+        self.orig = self.mw.col.get_note(nid)
+        self.prop, self.warnings = parse_note_to_proposal(self.orig)
+
+        self.oldView.setHtml(html_preview(self.orig, self.mw.col.media.dir()))
+        self.newView.setHtml(self._render_prop_html(self.prop) if self.prop else "<i>Kein sicherer Vorschlag – bitte Bearbeiten…</i>")
+        self.info.setText(" | ".join(self.warnings) if self.warnings else "")
+
+    def next(self):
+        if self.i < len(self.note_ids)-1:
+            self.i += 1; self.load()
+
+    def prev(self):
+        if self.i > 0:
+            self.i -= 1; self.load()
+
+    def jump_to(self):
+        try: idx = int(self.jumpEdit.text())
+        except Exception: return
+        if 1 <= idx <= len(self.note_ids):
+            self.i = idx-1; self.load()
+
+    def apply_current(self):
+        if not self.prop:
+            self.edit_current()
+            if not self.prop: return
+
+        key_tag = key_to_tag(normalize_combo_key(self.prop))
+        dup_hits = self.mw.col.find_notes(f'tag:"{key_tag}"')
+        if dup_hits:
+            btn = QMessageBox.question(self, "Dublettenhinweis",
+                f"Eine ähnliche Frage existiert bereits ({len(dup_hits)} Treffer). Trotzdem neu anlegen?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if btn != QMessageBox.Yes: return
+
+        self.mw.checkpoint("MC-Mapper apply")
+        n = Note(self.mw.col, self.model)
+        for f in FIELDS:
+            n[f] = _with_img_breaks_exact(self.prop.get(f, ""))  # exakt 1 <br> vor/nach IMG
+        n.tags = list(set(n.tags))  # neue Karte: keine Alt-Tags
+
+        try:
+            orig_cids = list(self.orig.cards()); deck_id = orig_cids[0].did if orig_cids else self.mw.col.decks.get_current_id()
+        except Exception:
+            deck_id = self.mw.col.decks.get_current_id()
+        self.mw.col.add_note(n, deck_id)
+
+        # ALT markieren und ggf. aus Liste entfernen
+        o_tags = set(self.orig.tags); o_tags.add(TAG_NEW); self.orig.tags = list(o_tags); self.mw.col.update_note(self.orig)
+
+        if self.chkHideMigr.isChecked():
+            try: self.note_ids.remove(self.orig.id)
+            except ValueError: pass
+            if self.i >= len(self.note_ids): self.i = max(0, len(self.note_ids)-1)
+        else:
+            if self.i < len(self.note_ids)-1:
+                self.i += 1
+        self.load()
+
+    def edit_current(self):
+        dlg = EditForm(self, self.prop or {f:"" for f in FIELDS}, self.orig)
+        if dlg.exec():
+            self.prop = dlg.get_values()
+            self.newView.setHtml(self._render_prop_html(self.prop))
+
+def run_review(mw, note_ids):
+    Review(mw, note_ids).exec()
