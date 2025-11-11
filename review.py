@@ -3,14 +3,14 @@ import re
 from aqt.qt import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser,
     QLabel, QLineEdit, QMessageBox, QWidget, QScrollArea,
-    Qt, QCheckBox, QUrl, QTextOption
+    Qt, QCheckBox, QUrl, QTextOption, QInputDialog
 )
 from aqt import mw
 from anki.notes import Note
 
 from .config import TARGET_MODEL_NAME, FIELDS, TAG_NEW
 from .parsing import parse_note_to_proposal
-from .util import find_model_by_name, html_preview, normalize_combo_key, key_to_tag
+from .util import html_preview, normalize_combo_key, key_to_tag
 
 def _with_img_breaks_exact(html: str) -> str:
     if not html:
@@ -105,7 +105,7 @@ class Review(QDialog):
 
         top = QHBoxLayout()
         left = QVBoxLayout();  left.addWidget(QLabel("ALT"));           left.addWidget(self.oldView)
-        right = QVBoxLayout(); right.addWidget(QLabel("NEU (Vorschlag)")); right.addWidget(self.newView)
+        right = QVBoxLayout(); self.newLabel = QLabel("NEU (Vorschlag)"); right.addWidget(self.newLabel); right.addWidget(self.newView)
         top.addLayout(left); top.addLayout(right)
 
         nav = QHBoxLayout()
@@ -118,13 +118,43 @@ class Review(QDialog):
 
         lay = QVBoxLayout(self); lay.addLayout(top); lay.addLayout(nav); lay.addLayout(actions)
 
-        self.model = find_model_by_name(self.mw.col, TARGET_MODEL_NAME)
+        self.model = self._select_target_model()
         if not self.model:
-            QMessageBox.critical(self, "Fehlt", f"Notiztyp '{TARGET_MODEL_NAME}' nicht gefunden.")
             self.reject(); return
+        self.newLabel.setText(f"NEU ({self.model['name']})")
+        self.setWindowTitle(f"MC-Mapper – Review ({self.model['name']})")
 
         self._apply_filter()
         self.load()
+
+    def _select_target_model(self):
+        models = []
+        for m in self.mw.col.models.all():
+            field_names = {f["name"] for f in m.get("flds", [])}
+            if all(f in field_names for f in FIELDS):
+                models.append(m)
+
+        if not models:
+            QMessageBox.critical(self, "Kein passender Notiztyp", "Es wurde kein Notiztyp gefunden, der alle MC-Felder enthält.")
+            return None
+
+        names = [m["name"] for m in models]
+        default_idx = next((i for i, name in enumerate(names) if name == TARGET_MODEL_NAME), 0)
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Ziel-Notiztyp auswählen",
+            "In welchen Notiztyp sollen die Karten übernommen werden?",
+            names,
+            default_idx,
+            False,
+        )
+        if not ok:
+            return None
+        try:
+            idx = names.index(choice)
+        except ValueError:
+            return None
+        return models[idx]
 
     def _render_prop_html(self, prop: dict) -> str:
         css = """
@@ -210,7 +240,9 @@ class Review(QDialog):
         n = Note(self.mw.col, self.model)
         for f in FIELDS:
             n[f] = _with_img_breaks_exact(self.prop.get(f, ""))  # exakt 1 <br> vor/nach IMG
-        n.tags = list(set(n.tags))  # neue Karte: keine Alt-Tags
+        new_tags = set(n.tags)
+        new_tags.add(key_tag)
+        n.tags = list(new_tags)
 
         try:
             orig_cids = list(self.orig.cards()); deck_id = orig_cids[0].did if orig_cids else self.mw.col.decks.get_current_id()
