@@ -94,18 +94,24 @@ def _parse_structured_fields(note):
     question = strip_html_keep_media(_get(note, q_key))
 
     # options
-    opt_keys = []
+    opt_values = [""] * 5
     for i in range(1, 6):
+        chosen = None
         for cand in (
             f"q_{i}", f"q{i}", f"q-{i}", f"q {i}",
             f"option {i}", f"antwort {i}", f"answer {i}"
         ):
             if cand in fmap:
-                opt_keys.append(fmap[cand]); break
-    if not opt_keys:
+                chosen = fmap[cand]
+                break
+        if chosen:
+            opt_values[i - 1] = normalize_option_text(_get(note, chosen))
+
+    indexed_opts = [(idx, text) for idx, text in enumerate(opt_values) if text]
+    if not indexed_opts:
         return None
-    options = [normalize_option_text(_get(note, k)) for k in opt_keys]
-    options = [o for o in options if o]
+    options = [text for _, text in indexed_opts]
+    idx_lookup = {orig_idx: pos for pos, (orig_idx, _) in enumerate(indexed_opts)}
 
     # solution bitstring / letter
     sol_key = (
@@ -117,6 +123,8 @@ def _parse_structured_fields(note):
         sol_raw_html = _get(note, sol_key)
         sol_raw = strip_html_keep_media(sol_raw_html)
 
+        selected_orig_idx = None
+
         # spaced „1 0 0 0 0“
         m = BIN_5_SPACED.search(sol_raw)
         if m:
@@ -127,7 +135,33 @@ def _parse_structured_fields(note):
             bits = [int(x) for x in m2.group(0)] if m2 else []
 
         if bits and bits.count(1) == 1:
-            correct_idx = bits.index(1)
+            selected_orig_idx = bits.index(1)
+        else:
+            stripped = sol_raw.strip()
+            m_letter = LETTER_ONLY.match(stripped)
+            if m_letter:
+                selected_orig_idx = "ABCDE".index(m_letter.group(1).upper())
+            else:
+                m_letter_plus = LETTER_PLUS.match(stripped)
+                if m_letter_plus:
+                    letter_idx = "ABCDE".index(m_letter_plus.group(1).upper())
+                    tail = normalize_option_text(m_letter_plus.group(2))
+                    if tail:
+                        for orig_idx, text in indexed_opts:
+                            if normalize_option_text(text) == tail:
+                                selected_orig_idx = orig_idx
+                                break
+                    if selected_orig_idx is None:
+                        selected_orig_idx = letter_idx
+                else:
+                    sol_norm = normalize_option_text(sol_raw)
+                    for orig_idx, text in indexed_opts:
+                        if normalize_option_text(text) == sol_norm:
+                            selected_orig_idx = orig_idx
+                            break
+
+        if selected_orig_idx is not None:
+            correct_idx = idx_lookup.get(selected_orig_idx)
 
     # optional comment
     for cand in ("comment", "kommentar", "extra 1", "extra", "notes"):
