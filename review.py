@@ -210,7 +210,9 @@ class Review(QDialog):
         n = Note(self.mw.col, self.model)
         for f in FIELDS:
             n[f] = _with_img_breaks_exact(self.prop.get(f, ""))  # exakt 1 <br> vor/nach IMG
-        n.tags = list(set(n.tags))  # neue Karte: keine Alt-Tags
+        new_tags = set(n.tags)
+        new_tags.add(key_tag)
+        n.tags = list(new_tags)
 
         try:
             orig_cids = list(self.orig.cards()); deck_id = orig_cids[0].did if orig_cids else self.mw.col.decks.get_current_id()
