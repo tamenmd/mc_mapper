@@ -1,6 +1,6 @@
 # config.py — zentrale Konfiguration für MC-Mapper
 
-# Ziel-Notiztyp
+# Standard-Ziel-Notiztyp (Vorauswahl, kann beim Start geändert werden)
 TARGET_MODEL_NAME = "MC7-DZ"
 
 # Ziel-Feldreihenfolge
