@@ -1,7 +1,6 @@
 from aqt import mw, gui_hooks
 from aqt.qt import QAction
 from .review import run_review
-from .settings import open_settings_dialog
 
 # ---- Tools-Menü ----
 def _run_review_from_tools():
@@ -17,10 +16,6 @@ def _run_review_from_tools():
 tools_review = QAction("MC-Mapper…", mw)
 tools_review.triggered.connect(_run_review_from_tools)
 mw.form.menuTools.addAction(tools_review)
-
-tools_ai = QAction("MC-Mapper KI-Einstellungen…", mw)
-tools_ai.triggered.connect(lambda: open_settings_dialog(mw))
-mw.form.menuTools.addAction(tools_ai)
 
 # ---- Browser-Menüs ----
 def _ensure_browser_menu_actions(browser):
