@@ -10,7 +10,9 @@ from anki.notes import Note
 
 from .config import TARGET_MODEL_NAME, FIELDS, TAG_NEW
 from .parsing import parse_note_to_proposal
-from .util import html_preview, normalize_combo_key, key_to_tag
+from .settings import get_settings
+from .ai import AISettings as AIConfig, enhance_proposal
+from .util import html_preview, normalize_combo_key, key_to_tag, strip_html_keep_media
 
 def _with_img_breaks_exact(html: str) -> str:
     if not html:
@@ -75,6 +77,8 @@ class Review(QDialog):
         self.note_ids = list(self.all_note_ids)
         self.i = 0
         self.setWindowTitle("MC-Mapper – Review")
+        self.ai_meta = {}
+        self.ai_status = "disabled"
 
         self.oldView = QTextBrowser()
         self.newView = QTextBrowser()
@@ -195,6 +199,23 @@ class Review(QDialog):
         self.btnPrev.setEnabled(self.i > 0); self.btnNext.setEnabled(self.i < len(self.note_ids)-1)
         total = len(self.note_ids); self.posLbl.setText(f"{(self.i+1) if total else 0}/{total}")
 
+    def _build_ai_context(self, note):
+        context = {"notiztyp": note.model().get("name", ""), "felder": {}}
+        try:
+            for fld in note.model().get("flds", []):
+                name = fld.get("name", "")
+                if not name:
+                    continue
+                try:
+                    context["felder"][name] = strip_html_keep_media(note[name])
+                except Exception:
+                    context["felder"][name] = ""
+        except Exception:
+            pass
+        context["tags"] = list(getattr(note, "tags", []))
+        context["guid"] = getattr(note, "guid", "")
+        return context
+
     def load(self):
         if not self.note_ids:
             self.oldView.setHtml("<i>Keine Notizen in der aktuellen Auswahl/Filter.</i>")
@@ -204,10 +225,55 @@ class Review(QDialog):
         nid = self.note_ids[self.i]
         self.orig = self.mw.col.get_note(nid)
         self.prop, self.warnings = parse_note_to_proposal(self.orig)
+        self.ai_meta = {}
+        self.ai_status = "disabled"
+
+        addon_settings = get_settings()
+        ai_config = AIConfig(
+            enabled=addon_settings.enable_ai,
+            api_key=addon_settings.openai_api_key,
+            model=addon_settings.openai_model,
+            temperature=addon_settings.openai_temperature,
+        )
+
+        if self.prop and ai_config.enabled:
+            context = self._build_ai_context(self.orig)
+            self.mw.progress.start(label="KI-Überarbeitung…", immediate=True)
+            try:
+                ai_result = enhance_proposal(self.prop, context=context, settings=ai_config)
+            finally:
+                self.mw.progress.finish()
+
+            if ai_result.proposal:
+                self.prop = ai_result.proposal
+                self.ai_status = "enabled"
+            if ai_result.meta:
+                self.ai_meta = ai_result.meta
+                dup = self.ai_meta.get("duplicate_signature")
+                if dup:
+                    self.prop["_duplicate_signature"] = dup
+            if ai_result.warnings:
+                self.warnings.extend(ai_result.warnings)
+                self.ai_status = "warning"
+        elif self.prop:
+            # Fallback-Signatur ohne KI, falls benötigt
+            self.prop["_duplicate_signature"] = normalize_combo_key(self.prop)
+
+        if self.prop and "_duplicate_signature" not in self.prop:
+            self.prop["_duplicate_signature"] = normalize_combo_key(self.prop)
 
         self.oldView.setHtml(html_preview(self.orig, self.mw.col.media.dir()))
         self.newView.setHtml(self._render_prop_html(self.prop) if self.prop else "<i>Kein sicherer Vorschlag – bitte Bearbeiten…</i>")
-        self.info.setText(" | ".join(self.warnings) if self.warnings else "")
+        info_parts = []
+        if self.warnings:
+            info_parts.extend(self.warnings)
+        if self.ai_meta.get("notes"):
+            info_parts.append(f"KI: {self.ai_meta['notes']}")
+        elif self.ai_status == "enabled":
+            info_parts.append("KI aktiv")
+        elif self.ai_status == "warning" and addon_settings.enable_ai:
+            info_parts.append("KI mit Warnungen")
+        self.info.setText(" | ".join(info_parts))
 
     def next(self):
         if self.i < len(self.note_ids)-1:
@@ -228,7 +294,8 @@ class Review(QDialog):
             self.edit_current()
             if not self.prop: return
 
-        key_tag = key_to_tag(normalize_combo_key(self.prop))
+        dup_key = self.prop.get("_duplicate_signature") or normalize_combo_key(self.prop)
+        key_tag = key_to_tag(dup_key)
         dup_hits = self.mw.col.find_notes(f'tag:"{key_tag}"')
         if dup_hits:
             btn = QMessageBox.question(self, "Dublettenhinweis",
@@ -266,6 +333,7 @@ class Review(QDialog):
         dlg = EditForm(self, self.prop or {f:"" for f in FIELDS}, self.orig)
         if dlg.exec():
             self.prop = dlg.get_values()
+            self.prop["_duplicate_signature"] = normalize_combo_key(self.prop)
             self.newView.setHtml(self._render_prop_html(self.prop))
 
 def run_review(mw, note_ids):
