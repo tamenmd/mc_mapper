@@ -166,16 +166,26 @@ class Review(QDialog):
           .val  { display:inline; }
           .sep  { margin: 8px 0; border-top: 1px dashed rgba(255,255,255,0.15); }
           img   { max-width:100%; height:auto; display:block; margin:6px 0; }
+          .row.question-label .lab { color: rgb(0, 150, 255); }
+          .row.opt-right { background: rgba(40, 167, 69, 0.12); border-left: 3px solid rgba(40, 167, 69, 0.6); border-radius: 4px; padding-left: 8px; }
+          .row.opt-right .lab, .row.opt-right .val { color: #2aa158; }
+          .row.opt-wrong .lab { color: #a0a0a0; }
+          .row.opt-wrong .val { color: #bcbcbc; }
         </style>
         """
         rows = []
-        def add_row(label, value):
-            rows.append(f"<div class='row'><span class='lab'>{label}:</span> <span class='val'>{_inline_html(value)}</span></div>")
+        def add_row(label, value, row_class=None):
+            cls = "row"
+            if row_class:
+                cls += f" {row_class}"
+            rows.append(f"<div class='{cls}'><span class='lab'>{label}:</span> <span class='val'>{_inline_html(value)}</span></div>")
 
-        add_row("Frage",     prop.get("Frage",""))
+        add_row("Frage",     prop.get("Frage",""), row_class="question-label")
         rows.append("<div class='sep'></div>")
+        correct_key = "Antwort A"
         for k in ["Antwort A","Antwort B","Antwort C","Antwort D","Antwort E"]:
-            add_row(k, prop.get(k,""))
+            cls = "opt-right" if k == correct_key else "opt-wrong"
+            add_row(k, prop.get(k,""), row_class=cls)
         rows.append("<div class='sep'></div>")
         add_row("Kopfzeile",      prop.get("Kopfzeile",""))
         add_row("Eigene Notizen", prop.get("Eigene Notizen",""))
