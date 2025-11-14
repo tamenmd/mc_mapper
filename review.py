@@ -3,8 +3,7 @@ import re
 from aqt.qt import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser,
     QLabel, QLineEdit, QMessageBox, QWidget, QScrollArea,
-    Qt, QCheckBox, QUrl, QTextOption, QComboBox, QToolButton,
-    QMenu, QWidgetAction
+    Qt, QCheckBox, QUrl, QTextOption, QComboBox
 )
 from aqt import mw
 from anki.notes import Note
@@ -101,64 +100,22 @@ class Review(QDialog):
         self.btnApply.clicked.connect(self.apply_current)
         self.btnEdit.clicked.connect(self.toggle_edit_panel)
 
-        self.filterButton = QToolButton(self)
-        self.filterButton.setText("Filter")
-        self.filterButton.setToolTip("Filteroptionen anzeigen")
-        self.filterButton.setPopupMode(QToolButton.InstantPopup)
-        self.filterMenu = QMenu(self.filterButton)
-        self.filterButton.setMenu(self.filterMenu)
+        self.chkHideMigr = QCheckBox('„migrated/by-mc-mapper“ ausblenden')
+        self.chkHideMigr.setToolTip("ALT-Karten, die bereits markiert wurden, im Review ausblenden.")
 
-        filtersHost = QWidget(self.filterMenu)
-        filtersLayout = QVBoxLayout(filtersHost)
-        filtersLayout.setContentsMargins(8, 6, 8, 6)
-        filtersLayout.setSpacing(4)
+        self.chkWarnOnly = QCheckBox("Nur Karten mit Warnungen")
+        self.chkWarnOnly.setToolTip("Zeigt nur Notizen, bei denen der Parser Warnungen erzeugt hat.")
+        self.chkNoCorrect = QCheckBox("Nur Karten ohne erkannte richtige Antwort")
+        self.chkNoCorrect.setToolTip("Filtert auf Vorschläge ohne eindeutig erkannte richtige Antwort.")
+        self.chkOrigOnly = QCheckBox("Nur Karten vom ursprünglichen Notiztyp (unmigrated)")
+        self.chkOrigOnly.setToolTip("Blendet Notizen aus, die bereits dem Ziel-Notiztyp entsprechen.")
+        self.chkMigrOnly = QCheckBox("Nur Karten, die bereits migriert wurden (TAG_NEW)")
+        self.chkMigrOnly.setToolTip("Zeigt nur Notizen, die das TAG_NEW tragen.")
+        self.chkDupOnly = QCheckBox("Nur Karten mit erkannten Dubletten")
+        self.chkDupOnly.setToolTip("Filtert auf Notizen, für die ein Dubletten-Tag (key_to_tag/normalize_combo_key) gefunden wurde.")
 
-        filter_specs = [
-            (
-                "„migrated/by-mc-mapper“ ausblenden",
-                "ALT-Karten, die bereits markiert wurden, im Review ausblenden.",
-                "chkHideMigr",
-            ),
-            (
-                "Nur Karten mit Warnungen",
-                "Zeigt nur Notizen, bei denen der Parser Warnungen erzeugt hat.",
-                "chkWarnOnly",
-            ),
-            (
-                "Nur Karten ohne erkannte richtige Antwort",
-                "Filtert auf Vorschläge ohne eindeutig erkannte richtige Antwort.",
-                "chkNoCorrect",
-            ),
-            (
-                "Nur Karten vom ursprünglichen Notiztyp (unmigrated)",
-                "Blendet Notizen aus, die bereits dem Ziel-Notiztyp entsprechen.",
-                "chkOrigOnly",
-            ),
-            (
-                "Nur Karten, die bereits migriert wurden (TAG_NEW)",
-                "Zeigt nur Notizen, die das TAG_NEW tragen.",
-                "chkMigrOnly",
-            ),
-            (
-                "Nur Karten mit erkannten Dubletten",
-                "Filtert auf Notizen, für die ein Dubletten-Tag (key_to_tag/normalize_combo_key) gefunden wurde.",
-                "chkDupOnly",
-            ),
-        ]
-
-        self._filter_checks = []
-        for text, tooltip, attr in filter_specs:
-            chk = QCheckBox(text, filtersHost)
-            chk.setToolTip(tooltip)
+        for chk in (self.chkHideMigr, self.chkWarnOnly, self.chkNoCorrect, self.chkOrigOnly, self.chkMigrOnly, self.chkDupOnly):
             chk.stateChanged.connect(self._filters_changed)
-            filtersLayout.addWidget(chk)
-            setattr(self, attr, chk)
-            self._filter_checks.append(chk)
-
-        filtersLayout.addStretch(1)
-        filtersAction = QWidgetAction(self.filterMenu)
-        filtersAction.setDefaultWidget(filtersHost)
-        self.filterMenu.addAction(filtersAction)
 
         top = QHBoxLayout()
         left = QVBoxLayout();  left.addWidget(QLabel("ALT"));           left.addWidget(self.oldView)
@@ -171,9 +128,12 @@ class Review(QDialog):
         nav.addWidget(QLabel("Position:")); self.posLbl = QLabel(""); nav.addWidget(self.posLbl)
         nav.addSpacing(12); nav.addWidget(self.jumpEdit); nav.addWidget(self.btnJump)
         nav.addStretch()
-        nav.addWidget(self.filterButton)
-        nav.addSpacing(12)
-        nav.addWidget(self.info)
+        filter_checks = [self.chkHideMigr, self.chkWarnOnly, self.chkNoCorrect, self.chkOrigOnly, self.chkMigrOnly, self.chkDupOnly]
+        for idx, chk in enumerate(filter_checks):
+            nav.addWidget(chk)
+            if idx < len(filter_checks) - 1:
+                nav.addSpacing(6)
+        nav.addSpacing(12); nav.addWidget(self.info)
 
         actions = QHBoxLayout(); actions.addStretch(); actions.addWidget(self.btnEdit); actions.addWidget(self.btnApply)
 
@@ -185,7 +145,6 @@ class Review(QDialog):
         self.newLabel.setText(f"NEU ({self.model['name']})")
         self.setWindowTitle(f"MC-Mapper – Review ({self.model['name']})")
 
-        self._update_filter_button_text()
         self._apply_filter(reset_position=True)
 
     def _select_target_model(self):
@@ -273,12 +232,7 @@ class Review(QDialog):
             self.newView.setHtml(self._render_prop_html(self.prop))
 
     def _filters_changed(self, *_args):
-        self._update_filter_button_text()
         self._apply_filter(reset_position=True)
-
-    def _update_filter_button_text(self):
-        active = sum(1 for chk in getattr(self, "_filter_checks", []) if chk.isChecked())
-        self.filterButton.setText(f"Filter ({active})" if active else "Filter")
 
     def _render_prop_html(self, prop: dict) -> str:
         css = """
