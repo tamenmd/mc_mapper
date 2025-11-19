@@ -4,14 +4,15 @@ from aqt.qt import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser,
     QLabel, QLineEdit, QMessageBox, QWidget, QScrollArea,
     Qt, QCheckBox, QUrl, QTextOption, QComboBox, QToolButton,
-    QMenu, QWidgetAction
+    QMenu, QWidgetAction, QShortcut, QKeySequence, QApplication
 )
 from aqt import mw
 from anki.notes import Note
 
+# Imports aus deinen Modulen
 from .config import TARGET_MODEL_NAME, FIELDS, TAG_NEW
-from .parsing import parse_note_to_proposal
-from .util import html_preview, normalize_combo_key, key_to_tag
+from .parsing import parse_note_to_proposal, parse_with_llm
+from .util import html_preview, normalize_combo_key, key_to_tag, find_similar_notes_fuzzy
 
 def _with_img_breaks_exact(html: str) -> str:
     if not html:
@@ -87,19 +88,29 @@ class Review(QDialog):
 
         self.info = QLabel("")
 
+        # --- Navigation & Buttons ---
         self.btnPrev = QPushButton("◀ Zurück")
         self.btnNext = QPushButton("Weiter ▶")
         self.jumpEdit = QLineEdit(); self.jumpEdit.setPlaceholderText("zu # springen…"); self.jumpEdit.setFixedWidth(100)
         self.btnJump = QPushButton("Go")
         self.btnApply = QPushButton("Übernehmen")
         self.btnEdit = QPushButton("Bearbeiten anzeigen")
+        
+        self.btnAi = QPushButton("✨ AI-Fix")
+        self.btnAi.setToolTip("Versucht, die Frage mit OpenAI zu parsen (Key in Add-on Konfiguration nötig)")
+        
+        self.btnAuto = QPushButton("🚀 Auto-Sicher")
+        self.btnAuto.setToolTip("Übernimmt alle Karten, bei denen sich der Parser 100% sicher ist (Turbo-Modus)")
 
+        # Connections
         self.btnPrev.clicked.connect(self.prev)
         self.btnNext.clicked.connect(self.next)
         self.btnJump.clicked.connect(self.jump_to)
         self.jumpEdit.returnPressed.connect(self.jump_to)
         self.btnApply.clicked.connect(self.apply_current)
         self.btnEdit.clicked.connect(self.toggle_edit_panel)
+        self.btnAi.clicked.connect(self.on_ai_repair)
+        self.btnAuto.clicked.connect(self.on_auto_accept)
 
         self.filterButton = QToolButton(self)
         self.filterButton.setText("Filter")
@@ -113,36 +124,17 @@ class Review(QDialog):
         filtersLayout.setContentsMargins(8, 6, 8, 6)
         filtersLayout.setSpacing(4)
 
+        # --- FILTERS ---
         filter_specs = [
             (
-                "„migrated/by-mc-mapper“ ausblenden",
-                "ALT-Karten, die bereits markiert wurden, im Review ausblenden.",
+                "Bereits migrierte Karten ausblenden",
+                "Versteckt Karten, die das Add-on schon bearbeitet hat (Tag: migrated/by-mc-mapper).",
                 "chkHideMigr",
             ),
             (
-                "Nur Karten mit Warnungen",
-                "Zeigt nur Notizen, bei denen der Parser Warnungen erzeugt hat.",
-                "chkWarnOnly",
-            ),
-            (
-                "Nur Karten ohne erkannte richtige Antwort",
-                "Filtert auf Vorschläge ohne eindeutig erkannte richtige Antwort.",
+                "Nur Karten ohne eindeutige Lösung",
+                "Zeigt nur Karten, bei denen keine oder keine eindeutige richtige Antwort erkannt wurde.",
                 "chkNoCorrect",
-            ),
-            (
-                "Nur Karten vom ursprünglichen Notiztyp (unmigrated)",
-                "Blendet Notizen aus, die bereits dem Ziel-Notiztyp entsprechen.",
-                "chkOrigOnly",
-            ),
-            (
-                "Nur Karten, die bereits migriert wurden (TAG_NEW)",
-                "Zeigt nur Notizen, die das TAG_NEW tragen.",
-                "chkMigrOnly",
-            ),
-            (
-                "Nur Karten mit erkannten Dubletten",
-                "Filtert auf Notizen, für die ein Dubletten-Tag (key_to_tag/normalize_combo_key) gefunden wurde.",
-                "chkDupOnly",
             ),
         ]
 
@@ -175,7 +167,12 @@ class Review(QDialog):
         nav.addSpacing(12)
         nav.addWidget(self.info)
 
-        actions = QHBoxLayout(); actions.addStretch(); actions.addWidget(self.btnEdit); actions.addWidget(self.btnApply)
+        actions = QHBoxLayout()
+        actions.addWidget(self.btnAuto)
+        actions.addStretch()
+        actions.addWidget(self.btnAi)
+        actions.addWidget(self.btnEdit)
+        actions.addWidget(self.btnApply)
 
         lay = QVBoxLayout(self); lay.addLayout(top); lay.addLayout(nav); lay.addLayout(actions)
 
@@ -184,6 +181,12 @@ class Review(QDialog):
             self.reject(); return
         self.newLabel.setText(f"NEU ({self.model['name']})")
         self.setWindowTitle(f"MC-Mapper – Review ({self.model['name']})")
+        
+        # Shortcuts
+        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self.apply_current)
+        QShortcut(QKeySequence("Ctrl+Right"), self).activated.connect(self.next)
+        QShortcut(QKeySequence("Ctrl+Left"), self).activated.connect(self.prev)
+        QShortcut(QKeySequence("Ctrl+A"), self).activated.connect(self.on_ai_repair)
 
         self._update_filter_button_text()
         self._apply_filter(reset_position=True)
@@ -319,29 +322,29 @@ class Review(QDialog):
 
     def apply_all_filters(self):
         filtered = []
+        config = mw.addonManager.getConfig(__name__) or {}
+        
         for nid in self.all_note_ids:
             note = self.mw.col.get_note(nid)
             if note is None:
                 continue
             tags = set(note.tags)
-            if self.chkHideMigr.isChecked() and TAG_NEW in tags:
-                continue
-            if self.chkMigrOnly.isChecked() and TAG_NEW not in tags:
-                continue
-            if self.chkOrigOnly.isChecked():
+            
+            if self.model:
                 try:
-                    if self.model and note.model().get("name") == self.model.get("name"):
+                    if note.model().get("name") == self.model.get("name"):
                         continue
                 except Exception:
-                    continue
+                    pass
 
-            info = self._get_note_info(nid, note)
-            if self.chkWarnOnly.isChecked() and not info.get("has_warnings"):
+            if self.chkHideMigr.isChecked() and TAG_NEW in tags:
                 continue
+            
+            info = self._get_note_info(nid, note)
+
             if self.chkNoCorrect.isChecked() and not info.get("no_correct"):
                 continue
-            if self.chkDupOnly.isChecked() and not info.get("has_duplicate"):
-                continue
+            
             filtered.append(nid)
         return filtered
 
@@ -363,13 +366,29 @@ class Review(QDialog):
             "no_correct": any("Keine eindeutige richtige Antwort" in w for w in warnings),
             "key_tag": None,
             "has_duplicate": False,
+            "is_fuzzy_duplicate": False,
         }
+        
+        config = mw.addonManager.getConfig(__name__) or {}
+        dup_thresh = config.get("duplicate_threshold", 0.85)
+
         if prop:
             combo_key = normalize_combo_key(prop)
             key_tag = key_to_tag(combo_key)
             info["key_tag"] = key_tag
+            
             hits = self.mw.col.find_notes(f'tag:"{key_tag}"') if key_tag else []
+            
+            is_fuzzy = False
+            if not hits and prop.get("Frage"):
+                fuzzy_hits = find_similar_notes_fuzzy(self.mw.col, prop["Frage"], threshold=dup_thresh)
+                if fuzzy_hits:
+                    hits = [h[0] for h in fuzzy_hits]
+                    is_fuzzy = True
+
             info["has_duplicate"] = any(hid != nid for hid in hits)
+            info["is_fuzzy_duplicate"] = is_fuzzy
+            
         return info
 
     def _get_note_info(self, nid: int, note=None):
@@ -423,10 +442,17 @@ class Review(QDialog):
         self.prop = prop
 
         self.oldView.setHtml(html_preview(self.orig, self.mw.col.media.dir()))
-        self.info.setText(" | ".join(self.warnings) if self.warnings else "")
+        
+        info = self._build_note_info(nid, self.orig, parsed_prop, self.warnings)
+        self._info_cache[nid] = info
+        
+        display_warnings = list(self.warnings)
+        if info.get("is_fuzzy_duplicate"):
+            display_warnings.append("⚠️ Ähnliche Frage gefunden (Fuzzy)")
+            
+        self.info.setText(" | ".join(display_warnings) if display_warnings else "")
         self._sync_edit_fields()
         self._update_preview()
-        self._info_cache[nid] = self._build_note_info(nid, self.orig, parsed_prop, self.warnings)
 
     def next(self):
         if self.i < len(self.note_ids)-1:
@@ -442,9 +468,95 @@ class Review(QDialog):
         if 1 <= idx <= len(self.note_ids):
             self.i = idx-1; self.load()
 
-    def apply_current(self):
+    def on_ai_repair(self):
+        if not self.orig: return
+        
+        raw_text = ""
+        for f in self.orig.keys():
+            raw_text += f"{f}: {self.orig[f]}\n"
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            prop, warnings = parse_with_llm(raw_text)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        if not prop:
+            QMessageBox.warning(self, "AI Error", "Konnte nicht parsen:\n" + "\n".join(warnings))
+            return
+
+        self.prop = prop
+        self._manual_override = True
+        self.warnings = ["✨ AI-Generated"] + warnings
+        self._update_preview()
+        self.info.setText(" | ".join(self.warnings))
+        self._sync_edit_fields()
+
+    def on_auto_accept(self):
+        accepted = 0
+        total = len(self.note_ids)
+        
+        if QMessageBox.question(self, "Auto-Accept", 
+            "Soll ich versuchen, alle 100% sicheren Karten automatisch zu verarbeiten? (Warnung: Dubletten werden ignoriert)", 
+            QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        self.mw.checkpoint("MC-Mapper Auto-Accept")
+        self.mw.progress.start(immediate=True)
+        
+        ids_to_process = list(self.note_ids)
+        
+        try:
+            for i, nid in enumerate(ids_to_process):
+                self.mw.progress.update(label=f"Verarbeite {i+1}/{len(ids_to_process)}...", value=i, max=len(ids_to_process))
+                
+                info = self._get_note_info(nid)
+                
+                if (info["prop"] 
+                    and not info["has_warnings"] 
+                    and not info["no_correct"]):
+                    
+                    orig_note = self.mw.col.get_note(nid)
+                    current_prop = info["prop"]
+                    
+                    if self.fixed_header and not current_prop.get("Kopfzeile"):
+                        current_prop["Kopfzeile"] = self.fixed_header
+
+                    n = Note(self.mw.col, self.model)
+                    for f in FIELDS:
+                        n[f] = _with_img_breaks_exact(current_prop.get(f, ""))
+                    
+                    try:
+                        orig_cids = list(orig_note.cards())
+                        deck_id = orig_cids[0].did if orig_cids else self.mw.col.decks.get_current_id()
+                    except:
+                        deck_id = self.mw.col.decks.get_current_id()
+                    
+                    self.mw.col.add_note(n, deck_id)
+
+                    o_tags = set(orig_note.tags)
+                    o_tags.add(TAG_NEW)
+                    orig_note.tags = list(o_tags)
+                    self.mw.col.update_note(orig_note)
+                    
+                    accepted += 1
+
+            self.mw.col.save()
+            self._info_cache.clear()
+            self._apply_filter(reset_position=True)
+                    
+        finally:
+            self.mw.progress.finish()
+            
+        QMessageBox.information(self, "Fertig", f"{accepted} von {total} Karten im Turbo-Modus verarbeitet!")
+
+    def apply_current(self, suppress_dialogs=False):
         if not self.note_ids or not self.orig:
             return
+        
+        self.mw.checkpoint("MC-Mapper apply")
+        self.mw.col.save()
+
         if not self._prop_generated and not self._manual_override:
             self._set_edit_panel_visible(True)
             return
@@ -454,28 +566,25 @@ class Review(QDialog):
             current_prop["Kopfzeile"] = self.fixed_header
 
         key_tag = key_to_tag(normalize_combo_key(current_prop))
-        dup_hits = self.mw.col.find_notes(f'tag:"{key_tag}"')
-        if dup_hits:
-            btn = QMessageBox.question(self, "Dublettenhinweis",
-                f"Eine ähnliche Frage existiert bereits ({len(dup_hits)} Treffer). Trotzdem neu anlegen?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if btn != QMessageBox.Yes: return
+        
+        if not suppress_dialogs:
+            dup_hits = self.mw.col.find_notes(f'tag:"{key_tag}"')
+            if dup_hits:
+                btn = QMessageBox.question(self, "Dublettenhinweis",
+                    f"Eine identische Frage existiert bereits ({len(dup_hits)} Treffer). Trotzdem neu anlegen?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if btn != QMessageBox.Yes: return
 
-        self.mw.checkpoint("MC-Mapper apply")
         n = Note(self.mw.col, self.model)
         for f in FIELDS:
-            n[f] = _with_img_breaks_exact(current_prop.get(f, ""))  # exakt 1 <br> vor/nach IMG
-        new_tags = set(n.tags)
-        new_tags.add(key_tag)
-        n.tags = list(new_tags)
-
+            n[f] = _with_img_breaks_exact(current_prop.get(f, ""))
+        
         try:
             orig_cids = list(self.orig.cards()); deck_id = orig_cids[0].did if orig_cids else self.mw.col.decks.get_current_id()
         except Exception:
             deck_id = self.mw.col.decks.get_current_id()
         self.mw.col.add_note(n, deck_id)
 
-        # ALT markieren und ggf. aus Liste entfernen
         o_tags = set(self.orig.tags); o_tags.add(TAG_NEW); self.orig.tags = list(o_tags); self.mw.col.update_note(self.orig)
 
         old_ids = list(self.note_ids)

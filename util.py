@@ -196,3 +196,34 @@ def normalize_combo_key(prop: dict) -> str:
 def key_to_tag(key: str) -> str:
     h = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     return f"{TAG_HASH_PREFIX}{h}"
+import difflib
+
+def compute_fuzz_ratio(text1: str, text2: str) -> float:
+    """Berechnet Ähnlichkeit zwischen 0.0 und 1.0."""
+    if not text1 or not text2:
+        return 0.0
+    return difflib.SequenceMatcher(None, text1, text2).ratio()
+
+def find_similar_notes_fuzzy(col, text: str, threshold: float = 0.85):
+    """Findet Notizen, deren 'Frage'-Feld dem Text ähnelt."""
+    # Performance-Hack: Suche erst grob nach Wörtern, dann fuzzy prüfen
+    # Um nicht die ganze DB zu scannen, suchen wir nach dem längsten Wort
+    words = [w for w in text.split() if len(w) > 4]
+    if not words:
+        return []
+    
+    # Suche nach einem signifikanten Wort um Kandidaten einzuschränken
+    search_term = words[0]
+    candidate_ids = col.find_notes(f'"{search_term}"')
+    
+    hits = []
+    for nid in candidate_ids:
+        note = col.get_note(nid)
+        # Wir nehmen an, das erste Feld ist die Frage (oder wir scannen alle)
+        n_text = note.fields[0] 
+        ratio = compute_fuzz_ratio(text, n_text)
+        if ratio >= threshold:
+            hits.append((nid, ratio))
+    
+    hits.sort(key=lambda x: x[1], reverse=True)
+    return hits
